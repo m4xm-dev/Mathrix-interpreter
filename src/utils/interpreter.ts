@@ -1,207 +1,247 @@
-import { IToken } from "chevrotain";
+import { LiteToken } from "../types";
 
-interface HydratedTokens {
-    values: Float64Array;
-    types: Int8Array;
-    active: Uint8Array;
-    len: number;
+interface SolveResult {
+    next: LiteToken[];
+    reduced: boolean;
 }
 
+interface BraceResult {
+    List: LiteToken[];
+    Result: number;
+}
+
+const makeNum = (value: number): LiteToken => ({
+    name: "num",
+    image: String(parseFloat(value.toFixed(10))),
+});
+
+const lCurly: LiteToken = { name: "lCurly", image: "{" };
+const rCurly: LiteToken = { name: "rCurly", image: "}" };
+
+const projectSteps = (
+    innerSteps: LiteToken[][],
+    left: LiteToken[],
+    right: LiteToken[]
+): LiteToken[][] =>
+    innerSteps.map(step => [...left, lCurly, ...step, rCurly, ...right]);
 
 class Interpreter {
-    constructor() { }
+    private tokens: LiteToken[] = [];
+    private pos: number = 0;
+    private levelIndex: number = 0;
+    private allSteps: LiteToken[][] = [];
 
-    private static readonly IDS: Record<string, number> = {
-        num: 0,
-        var: 1,
-        trigonometry: 2,
-        fraction: 3,
-        radication: 4,
-        exponentiation: 5,
-        sLevel: 6, // * y /
-        fLevel: 7  // + y -
+    private static readonly LEVELS = [
+        new Set(["exponentiation", "fraction", "radication", "trigonometry"]),
+        new Set(["sLevel"]),
+        new Set(["fLevel"]),
+    ] as const;
+
+    private static readonly TRIG: Readonly<Record<string, (x: number) => number>> = {
+        "\\sin": (x) => Math.sin(Interpreter.toRad(x)),
+        "\\cos": (x) => Math.cos(Interpreter.toRad(x)),
+        "\\tan": (x) => Math.tan(Interpreter.toRad(x)),
+        "\\csc": (x) => 1 / Math.sin(Interpreter.toRad(x)),
+        "\\sec": (x) => 1 / Math.cos(Interpreter.toRad(x)),
+        "\\cot": (x) => 1 / Math.tan(Interpreter.toRad(x)),
     };
 
-    private static readonly priorities = [
-        [Interpreter.IDS.fraction, Interpreter.IDS.radication, Interpreter.IDS.trigonometry],
-        [Interpreter.IDS.exponentiation],
-        [Interpreter.IDS.sLevel],
-        [Interpreter.IDS.fLevel]
-    ];
+    private static readonly toRad = (val: number): number => val * Math.PI / 180;
 
-    private execTrig(op: string, val: number): number {
-        switch (op) {
-            case '\\sin': return Math.sin(val);
-            case '\\cos': return Math.cos(val);
-            case '\\tan': return Math.tan(val);
-            default: return 0;
-        }
+    // ─── Cursor ──────────────────────────────────────────────────────────────────
+    private tok  = () => this.tokens[this.pos];
+    private is   = (n: string) => this.tok()?.name === n;
+    private img  = () => this.tok()?.image ?? "";
+    private next = () => this.tokens[this.pos++];
+    private eat  = (n: string) => {
+        if (!this.is(n)) throw new Error(`Expected '${n}', got '${this.tok()?.name ?? "EOF"}' ("${this.img()}")`);
+        return this.next();
+    };
+
+    // ─── Math helpers ────────────────────────────────────────────────────────────
+    private static safediv(a: number, b: number): number {
+        if (b === 0) throw new Error(`Division by zero: ${a} / ${b}`);
+        return a / b;
+    }
+    private static safesqrt(x: number): number {
+        if (x < 0) throw new Error(`sqrt of negative: ${x}`);
+        return Math.sqrt(x);
+    }
+    private static safetrig(name: string, arg: number): number {
+        const fn = Interpreter.TRIG[name];
+        if (!fn) throw new Error(`Unknown trig function: '${name}'`);
+        const r = fn(arg);
+        if (!isFinite(r)) throw new Error(`'${name}' undefined at ${arg}`);
+        return r;
     }
 
-    private static hydrate(tokens: IToken[]): HydratedTokens {
-        const len = tokens.length;
-        const values = new Float64Array(len)
-        const types = new Int8Array(len);
-        const active = new Uint8Array(len);
+    // ─── eatBraceValue ───────────────────────────────────────────────────────────
+    // `left` = tokens a la izquierda del bloque (para proyección).
+    // `right` se calcula internamente DESPUÉS de consumir las llaves,
+    //  por lo que siempre es exactamente lo que queda tras el rCurly.
+    private eatBraceValue(left: LiteToken[]): BraceResult {
+        this.eat("lCurly");
 
-        for (let i = 0; i < len; i++) {
-            const token = tokens[i]
-            const name = token.tokenType.name
+        const inner: LiteToken[] = [];
+        let depth = 1;
 
-            active[i] = 1
-            if (name === 'num') {
-                values[i] = Number(token.image)
-                types[i] = Interpreter.IDS.num
-            } else if (name === 'var') {
-                values[i] = 0;
-                types[i] = Interpreter.IDS.var
+        while (this.tok()) {
+            const t = this.next();
+            if (t.name === "lCurly") {
+                depth++;
+                inner.push(t);
+            } else if (t.name === "rCurly") {
+                depth--;
+                if (depth === 0) break;
+                inner.push(t);
             } else {
-                types[i] = Interpreter.IDS[name] ?? -1;
+                inner.push(t);
             }
         }
 
-        return { values, types, active, len };
+        if (depth !== 0) throw new Error("Unmatched '{' in expression");
+
+        // right capturado DESPUÉS de consumir el rCurly: pos ya apunta a lo que
+        // realmente queda, sin incluir las llaves que acabamos de consumir.
+        const right = this.tokens.slice(this.pos);
+
+        // Guardar estado del cursor padre
+        const savedTokens     = this.tokens;
+        const savedPos        = this.pos;
+        const savedLevelIndex = this.levelIndex;
+
+        // Resolver el interior capturando sus pasos en innerSteps
+        const innerSteps: LiteToken[][] = [inner];
+        const result = this.runLevels(inner, innerSteps);
+
+        // Restaurar estado del cursor padre
+        this.tokens     = savedTokens;
+        this.pos        = savedPos;
+        this.levelIndex = savedLevelIndex;
+
+        // Proyectar pasos internos al contexto del padre.
+        // Saltamos solo el primero (estado inicial, ya en allSteps del padre).
+        // El último (ej: \sin{3}) también se pushea: es el paso previo al resultado final.
+        const projected = projectSteps(innerSteps, left, right);
+        for (let i = 1; i < projected.length; i++) {
+            this.allSteps.push(projected[i]);
+        }
+
+        if (result.length !== 1 || result[0].name !== "num")
+            throw new Error(
+                `Brace content did not reduce to a single number: [${result.map(t => t.image).join(", ")}]`
+            );
+
+        return { List: result, Result: parseFloat(result[0].image) };
     }
 
+    // ─── runLevels ───────────────────────────────────────────────────────────────
+    private runLevels(t: LiteToken[], sink?: LiteToken[][]): LiteToken[] {
+        this.levelIndex = 0;
+        let current = t;
+        const target = sink ?? this.allSteps;
 
-    //~ obtiene los tokens
-    public resolveLegacy(tokens: IToken[]) {
-        const len = tokens.length;
-        if (len === 0) return [];
-
-        //~ creamos typedArrays para mayor rapidez y organizacion
-        const values = new Float64Array(len)
-        const types = new Int8Array(len);
-        const active = new Uint8Array(len);
-
-        //~ hidratamos las arrays con los datos de los tokens
-        for (let i = 0; i < len; i++) {
-            //* nombres y token actual
-            const token = tokens[i]
-            const name = token.tokenType.name
-
-            //* e el array de tokens activos, marcamos como activo el token con el index actual 
-            //* (significa que actualmente no lo borramos/colapsamos)
-            active[i] = 1
-            //* introducimos cada token en su array
-            //* marcamos en el array de tipos con el index actual la prioridad quecontiene
-            if (name === 'num') {
-                values[i] = Number(token.image)
-                types[i] = Interpreter.IDS.num
-            } else if (name === 'var') {
-                values[i] = 0;
-                types[i] = Interpreter.IDS.var
+        while (this.levelIndex < Interpreter.LEVELS.length) {
+            const { next, reduced } = this.solve(current);
+            if (reduced) {
+                target.push(next);
+                current = next;
             } else {
-                types[i] = Interpreter.IDS[name] ?? -1;
+                this.levelIndex++;
             }
         }
 
-        const priorities = [
-            [Interpreter.IDS.fraction, Interpreter.IDS.radication, Interpreter.IDS.trigonometry],
-            [Interpreter.IDS.exponentiation],
-            [Interpreter.IDS.sLevel],
-            [Interpreter.IDS.fLevel]
-        ];
+        return current;
+    }
 
-        for (let p = 0; p < priorities.length; p++) {
-            const currentGroup = priorities[p];
-            for (let i = 0; i < len; i++) {
-                if (active[i] === 0) continue;
+    // ─── API pública ─────────────────────────────────────────────────────────────
+    public resolveLoop(t: LiteToken[]): LiteToken[][] {
+        this.allSteps = [t];
+        this.runLevels(t);
+        return this.allSteps;
+    }
 
-                const type = types[i];
-                // Verificamos si el token actual pertenece a la capa de prioridad
-                let inPriority = false;
-                for (let g = 0; g < currentGroup.length; g++) {
-                    if (type === currentGroup[g]) {
-                        inPriority = true;
+    // ─── solve ───────────────────────────────────────────────────────────────────
+    private solve(t: LiteToken[]): SolveResult {
+        this.tokens = t;
+        this.pos    = 0;
+
+        const level = Interpreter.LEVELS[this.levelIndex];
+        const out: LiteToken[] = [];
+        let reduced = false;
+
+        while (this.tok()) {
+            const name = this.tok().name;
+
+            if (!reduced && level.has(name as any)) {
+                switch (name) {
+
+                    case "exponentiation": {
+                        const baseTok = out.pop()!;
+                        const opTok   = this.eat("exponentiation");
+                        const left    = [...out, baseTok, opTok];
+                        const exp     = this.eatBraceValue(left);
+                        out.push(makeNum(Math.pow(parseFloat(baseTok.image), exp.Result)));
+                        break;
+                    }
+
+                    case "fraction": {
+                        const fnTok = this.eat("fraction");
+
+                        // numerador: right incluye el bloque del denominador y lo que sigue,
+                        // pero lo calcula eatBraceValue internamente tras consumir {num}
+                        const leftNum = [...out, fnTok];
+                        const num     = this.eatBraceValue(leftNum);
+
+                        // denominador: left ya incluye '\frac {num}'
+                        const leftDen = [...out, fnTok, lCurly, ...num.List, rCurly];
+                        const den     = this.eatBraceValue(leftDen);
+
+                        out.push(makeNum(Interpreter.safediv(num.Result, den.Result)));
+                        break;
+                    }
+
+                    case "radication": {
+                        const fnTok = this.eat("radication");
+                        const left  = [...out, fnTok];
+                        const val   = this.eatBraceValue(left);
+                        out.push(makeNum(Interpreter.safesqrt(val.Result)));
+                        break;
+                    }
+
+                    case "trigonometry": {
+                        const fnTok = this.next();
+                        const left  = [...out, fnTok];
+                        const arg   = this.eatBraceValue(left);
+                        out.push(makeNum(Interpreter.safetrig(fnTok.image, arg.Result)));
+                        break;
+                    }
+
+                    case "sLevel": {
+                        const left  = parseFloat(out.pop()!.image);
+                        const op    = this.next().image;
+                        const right = parseFloat(this.eat("num").image);
+                        out.push(makeNum(op === "*" ? left * right : Interpreter.safediv(left, right)));
+                        break;
+                    }
+
+                    case "fLevel": {
+                        const left  = parseFloat(out.pop()!.image);
+                        const op    = this.next().image;
+                        const right = parseFloat(this.eat("num").image);
+                        out.push(makeNum(op === "+" ? left + right : left - right));
                         break;
                     }
                 }
+                reduced = true;
 
-                if (inPriority) {
-                    const tokenImage = tokens[i].image;
-
-                    // Buscamos operandos activos (izquierda y derecha)
-                    let leftIdx = i - 1;
-                    while (leftIdx >= 0 && active[leftIdx] === 0) leftIdx--;
-
-                    let rightIdx = i + 1;
-                    while (rightIdx < len && active[rightIdx] === 0) rightIdx++;
-
-                    let result = 0;
-
-                    // Lógica de cálculo por tipo
-                    switch (type) {
-                        case Interpreter.IDS.fLevel:
-                            result = tokenImage === '+'
-                                ? values[leftIdx] + values[rightIdx]
-                                : values[leftIdx] - values[rightIdx];
-                            break;
-
-                        case Interpreter.IDS.sLevel:
-                            result = tokenImage === '*'
-                                ? values[leftIdx] * values[rightIdx]
-                                : values[leftIdx] / values[rightIdx];
-                            break;
-
-                        case Interpreter.IDS.exponentiation:
-                            result = Math.pow(values[leftIdx], values[rightIdx]);
-                            break;
-
-                        case Interpreter.IDS.radication:
-                            // Nota: \sqrt usualmente precede al valor, por eso usamos solo right
-                            result = Math.sqrt(values[rightIdx]);
-                            break;
-
-                        case Interpreter.IDS.trigonometry:
-                            result = Interpreter.prototype.execTrig(tokenImage, values[rightIdx]);
-                            break;
-
-                        // Para \frac, dependerá de cómo tu lexer agrupe {num}{num}
-                        // Aquí un ejemplo simple asumiendo que el valor está a la derecha
-                        case Interpreter.IDS.fraction:
-                            // Lógica personalizada para manejar los bloques de la fracción
-                            break;
-                    }
-
-                    // Colapsamos: el resultado va a la posición del primer operando involucrado
-                    // Si es una función unaria (\sqrt), se guarda en su propia posición o en la del valor
-                    const targetIdx = (type === Interpreter.IDS.radication || type === Interpreter.IDS.trigonometry) ? i : leftIdx;
-
-                    values[targetIdx] = result;
-                    active[i] = 0;
-                    if (rightIdx < len) active[rightIdx] = 0;
-
-                    // Si el resultado reemplazó al operador (unario), reactivamos el target
-                    active[targetIdx] = 1;
-                }
+            } else {
+                out.push(this.next());
             }
-
         }
 
-        // 3. Retorno del valor final remanente
-        for (let i = 0; i < len; i++) {
-            if (active[i] === 1) return values[i];
-        }
-        return 0;
+        return { next: out, reduced };
     }
-
-    //~ necesito re crear la funcion resolve para mas legibilidad
-
-    public resolve(tokens: IToken[]) {
-        const hydrated = Interpreter.hydrate(tokens);
-
-        // Aquí iría la lógica de resolución usando hydrated.values, hydrated.types, etc.
-        // El proceso sería similar al de resolveLegacy pero con mejor organización y legibilidad.
-
-        return 0; // Retornar el resultado final
-    }
-
-    public analyze(tokens: IToken[]) {
-
-    }
-
 }
 
-export default Interpreter
-
+export default Interpreter;
